@@ -373,18 +373,23 @@ Execution rules:
 - Read the relevant project files first before acting, especially docs/ and any existing deliverables/ content from main.
 - You can use the dynamic tool linear_graphql to read from and write to Linear.
 - If GH_TOKEN is available in the environment, you may use git and gh non-interactively against the repo origin.
-- Every ticket must leave repo-tracked output. Write issue-scoped artifacts under deliverables/{{ issue.identifier }}/.
-- For non-coding tickets, the repo deliverable is required. Examples include plan.md, research.md, backlog.md, summary.md, decision-log.md, or review-summary.md as appropriate.
-- For coding tickets, make the code changes and also add any supporting issue-scoped notes under deliverables/{{ issue.identifier }}/ when useful.
-- Create and work from an issue-scoped feature branch, not main. Use a branch name derived from the issue identifier.
-- Before finishing, stage your repo changes, create a commit, and push the feature branch to origin. If push fails, leave the exact failure in a Linear comment.
-- If the issue asks for planning, backlog creation, research synthesis, or project management work, do that work in Linear and also persist the results under deliverables/{{ issue.identifier }}/ in the repo.
-- For planning/backlog tasks, create the necessary Linear issues directly, capture dependencies/priorities when possible, and leave a comment on the current issue summarizing what you created and where the repo deliverables live.
+- {% if issue.is_review %}This is a REVIEW ticket for {{ issue.review_source_identifier }}. Review tickets should deliver their result in Linear, not in the repo.{% else %}Every non-review ticket must leave meaningful repo-tracked output. Write issue-scoped artifacts under deliverables/{{ issue.identifier }}/ when the work is design, research, planning, or other substantive non-code output.{% endif %}
+- {% if issue.is_review %}Do not create a new branch or PR for the review ticket. Inspect the linked source branch/PR, review the relevant repo files, and post a single structured review result comment on this Linear issue using exactly this marker and JSON shape:
+  SYMPHONY_REVIEW_RESULT
+  {
+    "decision": "approve | request_changes | comment_only | blocked",
+    "summary": "short reviewer summary",
+    "required_changes": ["specific follow-up needed"],
+    "residual_risks": ["remaining risk"],
+    "reviewed_sha": "optional commit sha"
+  }
+  Use 'approve' only when the source PR is ready to merge. Use 'request_changes' when the worker should continue. Use 'comment_only' only when you cannot make a final approval decision yet but still have substantive review guidance. Use 'blocked' for concrete external blockers.{% else %}For non-coding tickets, the repo deliverable is required. Examples include plan.md, research.md, backlog.md, summary.md, or decision-log.md as appropriate.{% endif %}
+- {% if issue.is_review %}Review tickets should not create status-only commits, review-summary files, or operational repo bookkeeping. Leave the review deliverable in Linear comments only.{% else %}For coding tickets, make the code changes and also add supporting issue-scoped notes under deliverables/{{ issue.identifier }}/ when useful.{% endif %}
+- {% if issue.is_review %}Focus on substantive review findings: correctness, completeness, regressions, missing deliverables, and clear next action.{% else %}Create and work from an issue-scoped feature branch, not main. Use a branch name derived from the issue identifier.{% endif %}
+- {% if issue.is_review %}Symphony runtime owns PR creation/discovery, review-ticket creation, GitHub-to-Linear status sync, and merge-state bookkeeping when those actions are deterministic.{% else %}Before finishing, stage your repo changes, create a commit, and push the feature branch to origin. If push fails, leave the exact failure in a Linear comment.{% endif %}
+- {% if issue.is_review %}Do not spend time on workflow bookkeeping beyond posting the structured review result comment and any concise supporting reviewer notes that are actually helpful.{% else %}If the issue asks for planning, backlog creation, research synthesis, or project management work, do that work in Linear and also persist the substantive results under deliverables/{{ issue.identifier }}/ in the repo. For planning/backlog tasks, create the necessary Linear issues directly, capture dependencies/priorities when possible, and leave a comment on the current issue summarizing what you created and where the repo deliverables live.{% endif %}
 - Symphony runtime owns PR creation/discovery, review-ticket creation, GitHub-to-Linear status sync, and merge-state bookkeeping when those actions are deterministic.
 - For normal work issues, focus on the substantive work. Push the branch when you have a real deliverable; you do not need to create or update the PR or the review ticket yourself unless the runtime cannot do it.
-- For review issues whose title starts with REVIEW:, review the linked source branch and source PR. Do not create a new branch or PR for the review ticket itself.
-- For review issues, the required deliverable is a real GitHub review on the linked source PR. Before finishing the review, submit a review with gh such as 'gh pr review PR_NUMBER --approve --body "..."' or 'gh pr review PR_NUMBER --request-changes --body "..."' when the source PR is ready for a decision. Use 'gh pr review PR_NUMBER --comment --body "..."' only when you genuinely cannot make an approval decision yet.
-- Review tickets should produce review work, not workflow bookkeeping. Only write repo artifacts for the review ticket if they are genuine review deliverables.
 - Downstream tickets should treat main as the canonical source for prior deliverables, not unmerged feature branches.
 - Do not end a turn having done only private analysis. Produce externally visible progress each turn: repo changes, Linear issue creation/updates, or a comment explaining a concrete blocker.
 - If the docs are incomplete or ambiguous, create explicit follow-up issues in Linear for the missing decisions instead of silently stopping.

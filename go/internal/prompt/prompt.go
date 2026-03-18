@@ -118,15 +118,18 @@ func truthy(v any) bool {
 }
 
 func issueToMap(issue linear.Issue) map[string]any {
+	reviewSourceIdentifier := parseReviewSourceIdentifier(issue.Title)
 	out := map[string]any{
-		"id":          issue.ID,
-		"identifier":  issue.Identifier,
-		"title":       issue.Title,
-		"description": issue.Description,
-		"state":       issue.State,
-		"branch_name": issue.BranchName,
-		"url":         issue.URL,
-		"labels":      issue.Labels,
+		"id":                       issue.ID,
+		"identifier":               issue.Identifier,
+		"title":                    issue.Title,
+		"description":              issue.Description,
+		"state":                    issue.State,
+		"branch_name":              issue.BranchName,
+		"url":                      issue.URL,
+		"labels":                   issue.Labels,
+		"is_review":                reviewSourceIdentifier != "",
+		"review_source_identifier": reviewSourceIdentifier,
 	}
 	if issue.Priority != nil {
 		out["priority"] = *issue.Priority
@@ -152,3 +155,19 @@ func issueToMap(issue linear.Issue) map[string]any {
 }
 
 const timeLayout = "2006-01-02T15:04:05Z07:00"
+
+func parseReviewSourceIdentifier(title string) string {
+	trimmed := strings.TrimSpace(title)
+	if !strings.HasPrefix(strings.ToUpper(trimmed), "REVIEW:") {
+		return ""
+	}
+	rest := strings.TrimSpace(trimmed[len("REVIEW:"):])
+	if rest == "" {
+		return ""
+	}
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(fields[0])
+}

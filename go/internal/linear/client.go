@@ -40,6 +40,13 @@ type Issue struct {
 	UpdatedAt   *time.Time   `json:"updated_at,omitempty"`
 }
 
+type Comment struct {
+	ID        string     `json:"id"`
+	Body      string     `json:"body"`
+	CreatedAt *time.Time `json:"created_at,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
 type Client struct {
 	cfg        config.Config
 	httpClient *http.Client
@@ -276,6 +283,58 @@ func (c *Client) CreateComment(ctx context.Context, issueID, body string) error 
 	return err
 }
 
+func (c *Client) ListIssueComments(ctx context.Context, issueID string, limit int) ([]Comment, error) {
+	if strings.TrimSpace(issueID) == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	payload, err := c.graphql(ctx, issueCommentsQuery, map[string]any{
+		"id":    issueID,
+		"first": limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	issueNode, ok := digMap(payload, "data", "issue")
+	if !ok {
+		return nil, fmt.Errorf("linear_unknown_payload")
+	}
+	commentsNode, ok := digMap(issueNode, "comments")
+	if !ok {
+		return nil, fmt.Errorf("linear_unknown_payload")
+	}
+	nodes := sliceMap(commentsNode["nodes"])
+	out := make([]Comment, 0, len(nodes))
+	for _, node := range nodes {
+		id := stringOrEmpty(node["id"])
+		body := stringOrEmpty(node["body"])
+		if id == "" || body == "" {
+			continue
+		}
+		out = append(out, Comment{
+			ID:        id,
+			Body:      body,
+			CreatedAt: parseTime(node["createdAt"]),
+			UpdatedAt: parseTime(node["updatedAt"]),
+		})
+	}
+	slices.SortStableFunc(out, func(a, b Comment) int {
+		at := commentTime(a)
+		bt := commentTime(b)
+		switch {
+		case at.Before(bt):
+			return -1
+		case at.After(bt):
+			return 1
+		default:
+			return strings.Compare(a.ID, b.ID)
+		}
+	})
+	return out, nil
+}
+
 func (c *Client) GraphQL(ctx context.Context, query string, variables map[string]any) (map[string]any, error) {
 	return c.graphql(ctx, query, variables)
 }
@@ -485,6 +544,16 @@ func parseTime(v any) *time.Time {
 	return &t
 }
 
+func commentTime(c Comment) time.Time {
+	if c.UpdatedAt != nil {
+		return c.UpdatedAt.UTC()
+	}
+	if c.CreatedAt != nil {
+		return c.CreatedAt.UTC()
+	}
+	return time.Time{}
+}
+
 func nestedID(node map[string]any, key string) string {
 	child, _ := node[key].(map[string]any)
 	return stringOrEmpty(child["id"])
@@ -604,6 +673,21 @@ query WorkflowStatesForIssue($id: String!) {
           id
           name
         }
+      }
+    }
+  }
+}`
+
+const issueCommentsQuery = `
+query IssueComments($id: String!, $first: Int!) {
+  issue(id: $id) {
+    id
+    comments(first: $first) {
+      nodes {
+        id
+        body
+        createdAt
+        updatedAt
       }
     }
   }

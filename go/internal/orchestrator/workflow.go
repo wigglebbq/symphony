@@ -2,8 +2,11 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -20,13 +23,19 @@ const (
 	workflowStateMerged           = "merged"
 	workflowStateReviewPending    = "review_pending"
 	workflowStateReviewActive     = "review_active"
+	workflowStateApproved         = "approved"
+	workflowStateCommentOnly      = "comment_only"
+	workflowStateBlocked          = "blocked"
 	workflowStateClosedUnmerged   = "closed_unmerged"
+
+	reviewModeLinearArtifact = "linear_artifact"
 )
 
 type workflowInfo struct {
 	Role                  string
 	WorkflowState         string
 	CompletionGate        string
+	ReviewMode            string
 	SourceIssueID         string
 	SourceIssueIdentifier string
 	ReviewIssueID         string
@@ -37,7 +46,11 @@ type workflowInfo struct {
 	GitHubState           string
 	ReviewDecision        string
 	ReviewRound           int
+	ReviewSummary         string
+	ReviewedSHA           string
+	ReviewArtifactPath    string
 	LastSyncAt            time.Time
+	LastReviewSyncedAt    time.Time
 	LastSyncError         string
 	SuppressDispatch      bool
 	SkipReason            string
@@ -50,6 +63,18 @@ const (
 	postRunWait
 	postRunComplete
 )
+
+type reviewResult struct {
+	Decision         string
+	Summary          string
+	RequiredChanges  []string
+	ResidualRisks    []string
+	ReviewedSHA      string
+	CommentID        string
+	CommentCreatedAt time.Time
+}
+
+var reviewResultPattern = regexp.MustCompile("(?s)SYMPHONY_REVIEW_RESULT.*?```json\\s*(\\{.*?\\})\\s*```")
 
 func isReviewIssue(issue linear.Issue) bool {
 	return parseSourceIdentifierFromReviewTitle(issue.Title) != ""
@@ -174,6 +199,7 @@ func (o *Orchestrator) syncReviewIssueState(ctx context.Context, issue linear.Is
 	info := workflowInfo{
 		Role:                  workflowRoleReview,
 		CompletionGate:        "github+linear",
+		ReviewMode:            reviewModeLinearArtifact,
 		SourceIssueIdentifier: parseSourceIdentifierFromReviewTitle(issue.Title),
 		LastSyncAt:            time.Now().UTC(),
 	}
@@ -215,6 +241,20 @@ func (o *Orchestrator) syncReviewIssueState(ctx context.Context, issue linear.Is
 	info.PRURL = pr.URL
 	info.GitHubState = normalizePRState(pr)
 	info.ReviewDecision = pr.ReviewDecision
+	result, err := o.latestReviewResult(ctx, issue.ID)
+	if err != nil {
+		info.LastSyncError = err.Error()
+		o.setWorkflow(issue.ID, info)
+		return
+	}
+	if result != nil {
+		info.ReviewDecision = result.Decision
+		info.ReviewSummary = result.Summary
+		info.ReviewedSHA = result.ReviewedSHA
+		info.ReviewArtifactPath = "Linear issue comment " + result.CommentID
+		info.LastReviewSyncedAt = result.CommentCreatedAt
+	}
+	prev, _ := o.workflowInfo(issue.ID)
 	switch {
 	case pr.MergedAt != "":
 		info.WorkflowState = workflowStateMerged
@@ -222,7 +262,7 @@ func (o *Orchestrator) syncReviewIssueState(ctx context.Context, issue linear.Is
 		info.SkipReason = "merged"
 		_ = o.transitionIssueToTerminal(ctx, issue)
 		_ = o.transitionIssueToTerminal(ctx, sourceIssue)
-	case strings.EqualFold(pr.ReviewDecision, "APPROVED"):
+	case result != nil && result.Decision == workflowStateApproved:
 		if err := o.github.MergePR(ctx, workspacePath, pr.Number); err != nil {
 			info.WorkflowState = workflowStateReviewActive
 			info.LastSyncError = err.Error()
@@ -232,12 +272,26 @@ func (o *Orchestrator) syncReviewIssueState(ctx context.Context, issue linear.Is
 			info.SkipReason = "merged"
 			_ = o.transitionIssueToTerminal(ctx, issue)
 			_ = o.transitionIssueToTerminal(ctx, sourceIssue)
+			o.syncReviewDecisionSummary(ctx, prev, info, sourceIssue, issue, pr, result)
 		}
-	case strings.EqualFold(pr.ReviewDecision, "CHANGES_REQUESTED"):
+	case result != nil && result.Decision == workflowStateChangesRequested:
 		info.WorkflowState = workflowStateChangesRequested
 		info.SuppressDispatch = true
 		info.SkipReason = "changes_requested_recorded"
 		_ = o.transitionIssueToTerminal(ctx, issue)
+		o.syncReviewDecisionSummary(ctx, prev, info, sourceIssue, issue, pr, result)
+	case result != nil && result.Decision == workflowStateCommentOnly:
+		info.WorkflowState = workflowStateCommentOnly
+		info.SuppressDispatch = true
+		info.SkipReason = "comment_recorded"
+		_ = o.transitionIssueToTerminal(ctx, issue)
+		o.syncReviewDecisionSummary(ctx, prev, info, sourceIssue, issue, pr, result)
+	case result != nil && result.Decision == workflowStateBlocked:
+		info.WorkflowState = workflowStateBlocked
+		info.SuppressDispatch = true
+		info.SkipReason = "review_blocked"
+		_ = o.transitionIssueToTerminal(ctx, issue)
+		o.syncReviewDecisionSummary(ctx, prev, info, sourceIssue, issue, pr, result)
 	default:
 		info.WorkflowState = workflowStateReviewActive
 	}
@@ -252,7 +306,7 @@ func (o *Orchestrator) evaluatePostRun(ctx context.Context, result linear.Issue,
 		o.syncReviewIssueState(ctx, result, map[string]linear.Issue{})
 		if info, ok := o.workflowInfo(result.ID); ok {
 			switch info.WorkflowState {
-			case workflowStateMerged, workflowStateChangesRequested:
+			case workflowStateMerged, workflowStateChangesRequested, workflowStateApproved, workflowStateCommentOnly, workflowStateBlocked:
 				return postRunComplete
 			}
 		}
@@ -381,6 +435,152 @@ func normalizePRState(pr *githubclient.PullRequest) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(pr.State))
 	}
+}
+
+func (o *Orchestrator) latestReviewResult(ctx context.Context, issueID string) (*reviewResult, error) {
+	comments, err := o.linear.ListIssueComments(ctx, issueID, 50)
+	if err != nil {
+		return nil, err
+	}
+	return parseLatestReviewResult(comments), nil
+}
+
+func parseLatestReviewResult(comments []linear.Comment) *reviewResult {
+	if len(comments) == 0 {
+		return nil
+	}
+	sorted := slices.Clone(comments)
+	slices.SortStableFunc(sorted, func(a, b linear.Comment) int {
+		at := commentSortTime(a)
+		bt := commentSortTime(b)
+		switch {
+		case at.Before(bt):
+			return -1
+		case at.After(bt):
+			return 1
+		default:
+			return strings.Compare(a.ID, b.ID)
+		}
+	})
+	for i := len(sorted) - 1; i >= 0; i-- {
+		if result := parseReviewResultComment(sorted[i]); result != nil {
+			return result
+		}
+	}
+	return nil
+}
+
+func parseReviewResultComment(comment linear.Comment) *reviewResult {
+	match := reviewResultPattern.FindStringSubmatch(comment.Body)
+	if len(match) < 2 {
+		return nil
+	}
+	var payload struct {
+		Decision        string   `json:"decision"`
+		Summary         string   `json:"summary"`
+		RequiredChanges []string `json:"required_changes"`
+		ResidualRisks   []string `json:"residual_risks"`
+		ReviewedSHA     string   `json:"reviewed_sha"`
+	}
+	if err := json.Unmarshal([]byte(match[1]), &payload); err != nil {
+		return nil
+	}
+	decision := normalizeReviewDecision(payload.Decision)
+	if decision == "" {
+		return nil
+	}
+	return &reviewResult{
+		Decision:         decision,
+		Summary:          strings.TrimSpace(payload.Summary),
+		RequiredChanges:  compactStrings(payload.RequiredChanges),
+		ResidualRisks:    compactStrings(payload.ResidualRisks),
+		ReviewedSHA:      strings.TrimSpace(payload.ReviewedSHA),
+		CommentID:        comment.ID,
+		CommentCreatedAt: commentSortTime(comment),
+	}
+}
+
+func normalizeReviewDecision(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "approve", workflowStateApproved:
+		return workflowStateApproved
+	case "request_changes", "changes_requested":
+		return workflowStateChangesRequested
+	case "comment_only", "comment":
+		return workflowStateCommentOnly
+	case "blocked":
+		return workflowStateBlocked
+	default:
+		return ""
+	}
+}
+
+func compactStrings(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, item := range in {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func commentSortTime(comment linear.Comment) time.Time {
+	if comment.UpdatedAt != nil {
+		return comment.UpdatedAt.UTC()
+	}
+	if comment.CreatedAt != nil {
+		return comment.CreatedAt.UTC()
+	}
+	return time.Time{}
+}
+
+func (o *Orchestrator) syncReviewDecisionSummary(ctx context.Context, prev, next workflowInfo, sourceIssue, reviewIssue linear.Issue, pr *githubclient.PullRequest, result *reviewResult) {
+	if result == nil {
+		return
+	}
+	if prev.WorkflowState == next.WorkflowState && prev.ReviewDecision == next.ReviewDecision && prev.ReviewedSHA == next.ReviewedSHA {
+		return
+	}
+	body := reviewSummaryComment(sourceIssue, reviewIssue, pr, result)
+	if strings.TrimSpace(body) == "" {
+		return
+	}
+	_ = o.linear.CreateComment(ctx, sourceIssue.ID, body)
+}
+
+func reviewSummaryComment(sourceIssue, reviewIssue linear.Issue, pr *githubclient.PullRequest, result *reviewResult) string {
+	if result == nil {
+		return ""
+	}
+	lines := []string{
+		fmt.Sprintf("Symphony review result for %s from %s.", sourceIssue.Identifier, reviewIssue.Identifier),
+		"",
+		fmt.Sprintf("- Decision: %s", result.Decision),
+	}
+	if pr != nil {
+		lines = append(lines, fmt.Sprintf("- PR: #%d %s", pr.Number, pr.URL))
+	}
+	if result.ReviewedSHA != "" {
+		lines = append(lines, fmt.Sprintf("- Reviewed commit: `%s`", result.ReviewedSHA))
+	}
+	if result.Summary != "" {
+		lines = append(lines, "", "Summary:", result.Summary)
+	}
+	if len(result.RequiredChanges) > 0 {
+		lines = append(lines, "", "Required changes:")
+		for _, item := range result.RequiredChanges {
+			lines = append(lines, "- "+item)
+		}
+	}
+	if len(result.ResidualRisks) > 0 {
+		lines = append(lines, "", "Residual risks:")
+		for _, item := range result.ResidualRisks {
+			lines = append(lines, "- "+item)
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 func (o *Orchestrator) setWorkflow(issueID string, info workflowInfo) {

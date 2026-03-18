@@ -21,3 +21,18 @@ func TestBuildPrompt(t *testing.T) {
 		t.Fatalf("unexpected prompt: %q", out)
 	}
 }
+
+func TestBuildPromptReviewFields(t *testing.T) {
+	cfg := config.Config{
+		Workflow: config.WorkflowDefinition{
+			PromptTemplate: `{% if issue.is_review %}review {{ issue.review_source_identifier }}{% else %}normal{% endif %}`,
+		},
+	}
+	out, err := Build(cfg, linear.Issue{Identifier: "ABC-2", Title: "REVIEW: ABC-1 Ship it"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "review ABC-1" {
+		t.Fatalf("unexpected prompt: %q", out)
+	}
+}
