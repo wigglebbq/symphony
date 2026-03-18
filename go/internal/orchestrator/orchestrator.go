@@ -151,12 +151,14 @@ func (o *Orchestrator) dispatch(ctx context.Context, issue linear.Issue, attempt
 	o.mu.Lock()
 	o.claimed[issue.ID] = struct{}{}
 	runCtx, cancel := context.WithCancel(ctx)
+	workspacePath, _ := o.workspaces.Path(issue.Identifier, workerHost)
 	o.running[issue.ID] = &runningEntry{
 		issue:       issue,
 		attempt:     attempt,
 		startedAt:   time.Now().UTC(),
 		lastEventAt: time.Now().UTC(),
 		cancel:      cancel,
+		workspace:   workspacePath,
 		workerHost:  workerHost,
 	}
 	o.mu.Unlock()
@@ -294,6 +296,26 @@ func (o *Orchestrator) integrateEvent(issueID string, event agent.Event) {
 	if event.RateLimits != nil {
 		o.rateLimits = event.RateLimits
 	}
+	if shouldLogEvent(event) {
+		o.logger.Info("codex event",
+			"issue_id", entry.issue.ID,
+			"issue_identifier", entry.issue.Identifier,
+			"session_id", event.SessionID,
+			"event", event.Event,
+			"message", event.Message,
+		)
+	}
+}
+
+func shouldLogEvent(event agent.Event) bool {
+	switch event.Event {
+	case "session_started", "turn_completed", "turn_failed", "turn_cancelled", "turn_input_required", "approval_auto_approved", "tool_call_completed", "tool_call_failed", "unsupported_tool_call":
+		return true
+	case "notification":
+		return strings.HasPrefix(strings.TrimSpace(event.Message), "item/")
+	default:
+		return false
+	}
 }
 
 func (o *Orchestrator) handleResult(result agent.RunResult) {
@@ -356,12 +378,14 @@ func (o *Orchestrator) dispatchRetry(ctx context.Context, issue linear.Issue, at
 	o.claimed[issue.ID] = struct{}{}
 	runCtx, cancel := context.WithCancel(ctx)
 	attemptCopy := attempt
+	workspacePath, _ := o.workspaces.Path(issue.Identifier, workerHost)
 	o.running[issue.ID] = &runningEntry{
 		issue:       issue,
 		attempt:     &attemptCopy,
 		startedAt:   time.Now().UTC(),
 		lastEventAt: time.Now().UTC(),
 		cancel:      cancel,
+		workspace:   workspacePath,
 		workerHost:  workerHost,
 	}
 	o.mu.Unlock()

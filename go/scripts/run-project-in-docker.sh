@@ -291,6 +291,15 @@ Description:
 {% else %}
 No description provided.
 {% endif %}
+
+Execution rules:
+- Read the relevant project files first before acting.
+- You can use the dynamic tool linear_graphql to read from and write to Linear.
+- If the issue asks for planning, backlog creation, research synthesis, or project management work, do that work in Linear rather than only in the repo.
+- For planning/backlog tasks, create the necessary Linear issues directly, capture dependencies/priorities when possible, and leave a comment on the current issue summarizing what you created.
+- If the issue asks for code changes, make those changes in this workspace and leave the repo in a coherent state.
+- Do not end a turn having done only private analysis. Produce externally visible progress each turn: repo changes, Linear issue creation/updates, or a comment explaining a concrete blocker.
+- If the docs are incomplete or ambiguous, create explicit follow-up issues in Linear for the missing decisions instead of silently stopping.
 EOF
 
 if [[ "${FORCE_BUILD}" -eq 1 ]] || ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then

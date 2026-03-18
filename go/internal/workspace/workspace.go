@@ -110,6 +110,11 @@ func (m *Manager) Remove(ctx context.Context, identifier string, workerHost stri
 	return os.RemoveAll(path)
 }
 
+func (m *Manager) Path(identifier string, workerHost string) (string, error) {
+	key := sanitizePattern.ReplaceAllString(identifier, "_")
+	return m.workspacePath(key, workerHost)
+}
+
 func (m *Manager) workspacePath(key, workerHost string) (string, error) {
 	if workerHost != "" {
 		return filepath.Join(m.cfg.Workspace.Root, key), nil

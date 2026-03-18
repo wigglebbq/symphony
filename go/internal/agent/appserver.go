@@ -229,8 +229,11 @@ func (s *Session) RunTurn(ctx context.Context, prompt string, issue linear.Issue
 			case "turn/cancelled":
 				onEvent(s.eventFromMessage("turn_cancelled", sessionID, turnID, msg))
 				return sessionID, fmt.Errorf("turn_cancelled")
-			case "item/commandExecution/requestApproval", "execCommandApproval", "applyPatchApproval", "item/fileChange/requestApproval":
+			case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
 				_ = s.send(map[string]any{"id": msg["id"], "result": map[string]any{"approved": true, "decision": "acceptForSession"}})
+				onEvent(s.eventFromMessage("approval_auto_approved", sessionID, turnID, msg))
+			case "execCommandApproval", "applyPatchApproval":
+				_ = s.send(map[string]any{"id": msg["id"], "result": map[string]any{"approved": true, "decision": "approved_for_session"}})
 				onEvent(s.eventFromMessage("approval_auto_approved", sessionID, turnID, msg))
 			case "item/tool/requestUserInput":
 				onEvent(s.eventFromMessage("turn_input_required", sessionID, turnID, msg))
@@ -247,7 +250,10 @@ func (s *Session) RunTurn(ctx context.Context, prompt string, issue linear.Issue
 func (s *Session) handleToolCall(ctx context.Context, msg map[string]any, sessionID, turnID string, onEvent func(Event)) error {
 	id := msg["id"]
 	params, _ := msg["params"].(map[string]any)
-	tool, _ := params["name"].(string)
+	tool, _ := params["tool"].(string)
+	if strings.TrimSpace(tool) == "" {
+		tool, _ = params["name"].(string)
+	}
 	args, _ := params["arguments"].(map[string]any)
 	result := dynamicToolResult(false, "unsupported_tool_call")
 	eventName := "unsupported_tool_call"
@@ -382,24 +388,34 @@ func summarize(msg map[string]any) string {
 	if message, ok := params["message"].(string); ok {
 		return message
 	}
+	if text, ok := pathString(msg, "params", "msg", "payload", "text"); ok {
+		return text
+	}
+	if text, ok := pathString(msg, "params", "msg", "text"); ok {
+		return text
+	}
+	if method, _ := msg["method"].(string); strings.TrimSpace(method) != "" {
+		return method
+	}
 	return ""
 }
 
 func extractUsage(msg map[string]any) map[string]int64 {
-	for _, key := range []string{"usage", "total_token_usage", "tokenUsage"} {
-		if usage, ok := msg[key].(map[string]any); ok {
-			return map[string]int64{
-				"input_tokens":  int64(asFloat(usage["input_tokens"])),
-				"output_tokens": int64(asFloat(usage["output_tokens"])),
-				"total_tokens":  int64(asFloat(usage["total_tokens"])),
-			}
-		}
-		params, _ := msg["params"].(map[string]any)
-		if usage, ok := params[key].(map[string]any); ok {
-			return map[string]int64{
-				"input_tokens":  int64(asFloat(usage["input_tokens"])),
-				"output_tokens": int64(asFloat(usage["output_tokens"])),
-				"total_tokens":  int64(asFloat(usage["total_tokens"])),
+	for _, path := range [][]string{
+		{"params", "msg", "payload", "info", "total_token_usage"},
+		{"params", "msg", "info", "total_token_usage"},
+		{"params", "tokenUsage", "total"},
+		{"tokenUsage", "total"},
+		{"usage"},
+		{"total_token_usage"},
+		{"tokenUsage"},
+		{"params", "usage"},
+		{"params", "total_token_usage"},
+		{"params", "tokenUsage"},
+	} {
+		if usage, ok := pathMap(msg, path...); ok {
+			if out, ok := normalizeUsageMap(usage); ok {
+				return out
 			}
 		}
 	}
@@ -439,6 +455,64 @@ func asInt(v any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func pathMap(m map[string]any, path ...string) (map[string]any, bool) {
+	var current any = m
+	for _, part := range path {
+		next, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		current, ok = next[part]
+		if !ok {
+			return nil, false
+		}
+	}
+	out, ok := current.(map[string]any)
+	return out, ok
+}
+
+func pathString(m map[string]any, path ...string) (string, bool) {
+	var current any = m
+	for _, part := range path {
+		next, ok := current.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		current, ok = next[part]
+		if !ok {
+			return "", false
+		}
+	}
+	out, ok := current.(string)
+	return out, ok
+}
+
+func normalizeUsageMap(usage map[string]any) (map[string]int64, bool) {
+	input := asFloat(usage["input_tokens"])
+	if input == 0 {
+		input = asFloat(usage["inputTokens"])
+	}
+	output := asFloat(usage["output_tokens"])
+	if output == 0 {
+		output = asFloat(usage["outputTokens"])
+	}
+	total := asFloat(usage["total_tokens"])
+	if total == 0 {
+		total = asFloat(usage["totalTokens"])
+	}
+	if total == 0 {
+		total = asFloat(usage["total"])
+	}
+	if input == 0 && output == 0 && total == 0 {
+		return nil, false
+	}
+	return map[string]int64{
+		"input_tokens":  int64(input),
+		"output_tokens": int64(output),
+		"total_tokens":  int64(total),
+	}, true
 }
 
 func truncate(s string) string {
