@@ -69,7 +69,7 @@ type WorkerConfig struct {
 
 type CodexConfig struct {
 	Command           string
-	ApprovalPolicy    any
+	ApprovalPolicy    string
 	ThreadSandbox     string
 	TurnSandboxPolicy map[string]any
 	TurnTimeout       time.Duration
@@ -244,8 +244,8 @@ func Parse(def WorkflowDefinition) (Config, error) {
 		},
 		Codex: CodexConfig{
 			Command:        "codex app-server",
-			ApprovalPolicy: map[string]any{"reject": map[string]any{"sandbox_approval": true, "rules": true, "mcp_elicitations": true}},
-			ThreadSandbox:  "workspace-write",
+			ApprovalPolicy: "never",
+			ThreadSandbox:  "workspaceWrite",
 			TurnTimeout:    time.Hour,
 			ReadTimeout:    5 * time.Second,
 			StallTimeout:   5 * time.Minute,
@@ -320,13 +320,13 @@ func Parse(def WorkflowDefinition) (Config, error) {
 			cfg.Codex.Command = v
 		}
 		if v, ok := codex["approval_policy"]; ok && v != nil {
-			cfg.Codex.ApprovalPolicy = v
+			cfg.Codex.ApprovalPolicy = normalizeApprovalPolicy(v)
 		}
 		if v := stringValue(codex["thread_sandbox"]); v != "" {
-			cfg.Codex.ThreadSandbox = v
+			cfg.Codex.ThreadSandbox = normalizeSandboxType(v)
 		}
 		if v, ok := childMap(codex, "turn_sandbox_policy"); ok {
-			cfg.Codex.TurnSandboxPolicy = v
+			cfg.Codex.TurnSandboxPolicy = normalizeSandboxPolicy(v)
 		}
 		if n := intValue(codex["turn_timeout_ms"], 3600000); n > 0 {
 			cfg.Codex.TurnTimeout = time.Duration(n) * time.Millisecond
@@ -363,6 +363,16 @@ func Validate(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.Codex.Command) == "" {
 		return fmt.Errorf("missing_codex_command")
+	}
+	switch cfg.Codex.ApprovalPolicy {
+	case "untrusted", "on-failure", "on-request", "granular", "never":
+	default:
+		return fmt.Errorf("invalid_codex_approval_policy")
+	}
+	switch cfg.Codex.ThreadSandbox {
+	case "dangerFullAccess", "readOnly", "externalSandbox", "workspaceWrite":
+	default:
+		return fmt.Errorf("invalid_codex_thread_sandbox")
 	}
 	return nil
 }
@@ -418,7 +428,7 @@ func (c Config) RuntimeSandboxPolicy(workspace string) map[string]any {
 		root = c.Workspace.Root
 	}
 	return map[string]any{
-		"type": "workspace-write",
+		"type": "workspaceWrite",
 		"root": root,
 	}
 }
@@ -515,6 +525,52 @@ func intValue(v any, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func normalizeApprovalPolicy(v any) string {
+	switch t := v.(type) {
+	case string:
+		switch strings.TrimSpace(t) {
+		case "untrusted", "on-failure", "on-request", "granular", "never":
+			return strings.TrimSpace(t)
+		default:
+			return "never"
+		}
+	case map[string]any:
+		if _, ok := t["reject"]; ok {
+			return "never"
+		}
+	case map[any]any:
+		for key := range t {
+			if fmt.Sprint(key) == "reject" {
+				return "never"
+			}
+		}
+	}
+	return "never"
+}
+
+func normalizeSandboxType(value string) string {
+	switch strings.TrimSpace(value) {
+	case "dangerFullAccess", "danger-full-access":
+		return "dangerFullAccess"
+	case "readOnly", "read-only":
+		return "readOnly"
+	case "externalSandbox", "external-sandbox":
+		return "externalSandbox"
+	case "workspaceWrite", "workspace-write":
+		return "workspaceWrite"
+	default:
+		return "workspaceWrite"
+	}
+}
+
+func normalizeSandboxPolicy(v map[string]any) map[string]any {
+	out := normalizeMap(v)
+	if rawType, ok := out["type"]; ok {
+		out["type"] = normalizeSandboxType(stringValue(rawType))
+	}
+	return out
 }
 
 func resolveToken(value, defaultEnv string) string {

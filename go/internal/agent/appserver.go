@@ -120,7 +120,7 @@ func StartSession(ctx context.Context, cfg config.Config, workspace, workerHost 
 		"method": "thread/start",
 		"params": map[string]any{
 			"approvalPolicy": cfg.Codex.ApprovalPolicy,
-			"sandbox":        cfg.Codex.ThreadSandbox,
+			"sandbox":        threadSandboxValue(cfg.Codex.ThreadSandbox),
 			"cwd":            absWorkspace,
 			"dynamicTools": []map[string]any{{
 				"name":        "linear_graphql",
@@ -149,6 +149,19 @@ func StartSession(ctx context.Context, cfg config.Config, workspace, workerHost 
 	}
 	s.threadID = threadID
 	return s, nil
+}
+
+func threadSandboxValue(value string) string {
+	switch strings.TrimSpace(value) {
+	case "readOnly", "read-only":
+		return "read-only"
+	case "dangerFullAccess", "danger-full-access":
+		return "danger-full-access"
+	case "workspaceWrite", "workspace-write":
+		return "workspace-write"
+	default:
+		return "workspace-write"
+	}
 }
 
 func (s *Session) Stop() {
@@ -236,7 +249,7 @@ func (s *Session) handleToolCall(ctx context.Context, msg map[string]any, sessio
 	params, _ := msg["params"].(map[string]any)
 	tool, _ := params["name"].(string)
 	args, _ := params["arguments"].(map[string]any)
-	result := map[string]any{"success": false, "error": "unsupported_tool_call"}
+	result := dynamicToolResult(false, "unsupported_tool_call")
 	eventName := "unsupported_tool_call"
 	if tool == "linear_graphql" && s.linear != nil {
 		query, _ := args["query"].(string)
@@ -244,20 +257,39 @@ func (s *Session) handleToolCall(ctx context.Context, msg map[string]any, sessio
 			variables, _ := args["variables"].(map[string]any)
 			payload, err := s.linear.GraphQL(ctx, query, variables)
 			if err != nil {
-				result = map[string]any{"success": false, "error": err.Error()}
+				result = dynamicToolResult(false, err.Error())
 				eventName = "tool_call_failed"
 			} else {
-				result = map[string]any{"success": true, "payload": payload}
+				result = dynamicToolResult(true, jsonString(payload))
 				eventName = "tool_call_completed"
 			}
 		} else {
-			result = map[string]any{"success": false, "error": "invalid_graphql_input"}
+			result = dynamicToolResult(false, "invalid_graphql_input")
 			eventName = "tool_call_failed"
 		}
 	}
 	_ = s.send(map[string]any{"id": id, "result": result})
 	onEvent(s.eventFromMessage(eventName, sessionID, turnID, msg))
 	return nil
+}
+
+func dynamicToolResult(success bool, output string) map[string]any {
+	return map[string]any{
+		"success": success,
+		"output":  output,
+		"contentItems": []map[string]any{{
+			"type": "inputText",
+			"text": output,
+		}},
+	}
+}
+
+func jsonString(value any) string {
+	raw, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(raw)
 }
 
 func (s *Session) send(payload map[string]any) error {

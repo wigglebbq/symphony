@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"slices"
 	"strings"
@@ -44,7 +46,16 @@ func NewClient(cfg config.Config) *Client {
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 45 * time.Second,
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				ForceAttemptHTTP2:     false,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: time.Second,
+			},
 		},
 	}
 }
@@ -147,29 +158,71 @@ func (c *Client) GraphQL(ctx context.Context, query string, variables map[string
 
 func (c *Client) graphql(ctx context.Context, query string, variables map[string]any) (map[string]any, error) {
 	body, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		payload, retry, err := c.graphqlAttempt(ctx, body)
+		if err == nil {
+			return payload, nil
+		}
+		lastErr = err
+		if !retry || attempt == 3 || ctx.Err() != nil {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("linear_api_request: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) graphqlAttempt(ctx context.Context, body []byte) (map[string]any, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.Tracker.Endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("linear_api_request: %w", err)
+		return nil, false, fmt.Errorf("linear_api_request: %w", err)
 	}
 	req.Header.Set("Authorization", c.cfg.Tracker.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("linear_api_request: %w", err)
+		return nil, transientRequestError(err), fmt.Errorf("linear_api_request: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("linear_api_status: %d", resp.StatusCode)
+		retry := resp.StatusCode == http.StatusRequestTimeout ||
+			resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusGatewayTimeout
+		return nil, retry, fmt.Errorf("linear_api_status: %d", resp.StatusCode)
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return nil, fmt.Errorf("linear_unknown_payload: %w", err)
+		return nil, false, fmt.Errorf("linear_unknown_payload: %w", err)
 	}
 	if errs, ok := payload["errors"].([]any); ok && len(errs) > 0 {
-		return nil, fmt.Errorf("linear_graphql_errors")
+		return nil, false, fmt.Errorf("linear_graphql_errors")
 	}
-	return payload, nil
+	return payload, false, nil
+}
+
+func transientRequestError(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "client.timeout exceeded") ||
+		strings.Contains(msg, "server sent goaway") ||
+		strings.Contains(msg, "tls handshake timeout")
 }
 
 func normalizeIssue(node map[string]any) (Issue, bool) {
