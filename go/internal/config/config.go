@@ -72,6 +72,7 @@ type CodexConfig struct {
 	ApprovalPolicy    string
 	ThreadSandbox     string
 	TurnSandboxPolicy map[string]any
+	TmuxSessionPrefix string
 	TurnTimeout       time.Duration
 	ReadTimeout       time.Duration
 	StallTimeout      time.Duration
@@ -243,12 +244,13 @@ func Parse(def WorkflowDefinition) (Config, error) {
 			MaxConcurrentAgentsByState: map[string]int{},
 		},
 		Codex: CodexConfig{
-			Command:        "codex app-server",
-			ApprovalPolicy: "never",
-			ThreadSandbox:  "workspaceWrite",
-			TurnTimeout:    time.Hour,
-			ReadTimeout:    5 * time.Second,
-			StallTimeout:   5 * time.Minute,
+			Command:           "codex app-server",
+			ApprovalPolicy:    "never",
+			ThreadSandbox:     "workspaceWrite",
+			TmuxSessionPrefix: "",
+			TurnTimeout:       time.Hour,
+			ReadTimeout:       5 * time.Second,
+			StallTimeout:      5 * time.Minute,
 		},
 		Server: ServerConfig{
 			Port: -1,
@@ -260,9 +262,12 @@ func Parse(def WorkflowDefinition) (Config, error) {
 		if v := stringValue(tracker["endpoint"]); v != "" {
 			cfg.Tracker.Endpoint = v
 		}
-		cfg.Tracker.APIKey = resolveToken(stringValue(tracker["api_key"]), "LINEAR_API_KEY")
+		cfg.Tracker.APIKey = resolveToken(stringValue(tracker["api_key"]), "LINEAR_API_KEY", "LINEAR_API_TOKEN")
 		if cfg.Tracker.APIKey == "" && cfg.Tracker.Kind == "linear" {
 			cfg.Tracker.APIKey = strings.TrimSpace(os.Getenv("LINEAR_API_KEY"))
+			if cfg.Tracker.APIKey == "" {
+				cfg.Tracker.APIKey = strings.TrimSpace(os.Getenv("LINEAR_API_TOKEN"))
+			}
 		}
 		cfg.Tracker.ProjectSlug = stringValue(tracker["project_slug"])
 		if v := stringSlice(tracker["active_states"]); len(v) > 0 {
@@ -327,6 +332,9 @@ func Parse(def WorkflowDefinition) (Config, error) {
 		}
 		if v, ok := childMap(codex, "turn_sandbox_policy"); ok {
 			cfg.Codex.TurnSandboxPolicy = normalizeSandboxPolicy(v)
+		}
+		if v := stringValue(codex["tmux_session_prefix"]); v != "" {
+			cfg.Codex.TmuxSessionPrefix = v
 		}
 		if n := intValue(codex["turn_timeout_ms"], 3600000); n > 0 {
 			cfg.Codex.TurnTimeout = time.Duration(n) * time.Millisecond
@@ -428,8 +436,12 @@ func (c Config) RuntimeSandboxPolicy(workspace string) map[string]any {
 		root = c.Workspace.Root
 	}
 	return map[string]any{
-		"type": "workspaceWrite",
-		"root": root,
+		"type":                "workspaceWrite",
+		"writableRoots":       []string{root},
+		"readOnlyAccess":      map[string]any{"type": "fullAccess"},
+		"networkAccess":       false,
+		"excludeTmpdirEnvVar": false,
+		"excludeSlashTmp":     false,
 	}
 }
 
@@ -573,13 +585,32 @@ func normalizeSandboxPolicy(v map[string]any) map[string]any {
 	return out
 }
 
-func resolveToken(value, defaultEnv string) string {
+func resolveToken(value string, defaultEnv string, fallbackEnvs ...string) string {
 	value = strings.TrimSpace(value)
 	if value == "" && defaultEnv != "" {
-		return strings.TrimSpace(os.Getenv(defaultEnv))
+		if resolved := strings.TrimSpace(os.Getenv(defaultEnv)); resolved != "" {
+			return resolved
+		}
+		for _, envName := range fallbackEnvs {
+			if resolved := strings.TrimSpace(os.Getenv(envName)); resolved != "" {
+				return resolved
+			}
+		}
+		return ""
 	}
 	if strings.HasPrefix(value, "$") {
-		return strings.TrimSpace(os.Getenv(strings.TrimPrefix(value, "$")))
+		name := strings.TrimPrefix(value, "$")
+		if resolved := strings.TrimSpace(os.Getenv(name)); resolved != "" {
+			return resolved
+		}
+		if name == defaultEnv {
+			for _, envName := range fallbackEnvs {
+				if resolved := strings.TrimSpace(os.Getenv(envName)); resolved != "" {
+					return resolved
+				}
+			}
+		}
+		return ""
 	}
 	return value
 }

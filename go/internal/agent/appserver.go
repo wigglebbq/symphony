@@ -11,8 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/openai/symphony/go/internal/config"
@@ -24,6 +26,7 @@ type Event struct {
 	Event             string           `json:"event"`
 	Timestamp         time.Time        `json:"timestamp"`
 	CodexAppServerPID int              `json:"codex_app_server_pid,omitempty"`
+	TmuxSession       string           `json:"tmux_session,omitempty"`
 	SessionID         string           `json:"session_id,omitempty"`
 	ThreadID          string           `json:"thread_id,omitempty"`
 	TurnID            string           `json:"turn_id,omitempty"`
@@ -34,18 +37,21 @@ type Event struct {
 }
 
 type Session struct {
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	msgs       chan map[string]any
-	errs       chan error
-	cfg        config.Config
-	logger     *slog.Logger
-	linear     *linear.Client
-	threadID   string
-	workspace  string
-	workerHost string
-	pid        int
-	msgsClosed sync.Once
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	msgs        chan map[string]any
+	errs        chan error
+	cfg         config.Config
+	logger      *slog.Logger
+	linear      *linear.Client
+	threadID    string
+	workspace   string
+	workerHost  string
+	pid         int
+	tmuxSession string
+	stopCh      chan struct{}
+	stopOnce    sync.Once
+	msgsClosed  sync.Once
 }
 
 func StartSession(ctx context.Context, cfg config.Config, workspace, workerHost string, lc *linear.Client, logger *slog.Logger) (*Session, error) {
@@ -56,6 +62,9 @@ func StartSession(ctx context.Context, cfg config.Config, workspace, workerHost 
 		if err != nil {
 			return nil, fmt.Errorf("invalid_workspace_cwd: %w", err)
 		}
+	}
+	if workerHost == "" && strings.TrimSpace(cfg.Codex.TmuxSessionPrefix) != "" {
+		return startLocalTmuxSession(ctx, cfg, absWorkspace, lc, logger)
 	}
 	var cmd *exec.Cmd
 	if workerHost == "" {
@@ -90,10 +99,146 @@ func StartSession(ctx context.Context, cfg config.Config, workspace, workerHost 
 		workspace:  absWorkspace,
 		workerHost: workerHost,
 		pid:        cmd.Process.Pid,
+		stopCh:     make(chan struct{}),
 	}
+	workerLabel := workerHost
+	if workerLabel == "" {
+		workerLabel = "local"
+	}
+	s.logger.Info("codex session configured",
+		"workspace", absWorkspace,
+		"worker_host", workerLabel,
+		"tmux_session", s.tmuxSession,
+		"thread_sandbox", threadSandboxValue(cfg.Codex.ThreadSandbox),
+		"turn_sandbox_policy", jsonString(cfg.RuntimeSandboxPolicy(absWorkspace)),
+	)
 	go s.readStdout(stdout)
 	go s.readStderr(stderr)
 	go func() { s.errs <- cmd.Wait() }()
+	if err := s.send(map[string]any{
+		"id":     1,
+		"method": "initialize",
+		"params": map[string]any{
+			"clientInfo": map[string]any{
+				"name":    "symphony-go",
+				"version": "0.1.0",
+			},
+			"capabilities": map[string]any{
+				"experimentalApi": true,
+			},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	if _, err := s.awaitResponse(ctx, 1); err != nil {
+		return nil, err
+	}
+	if err := s.send(map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
+		return nil, err
+	}
+	if err := s.send(map[string]any{
+		"id":     2,
+		"method": "thread/start",
+		"params": map[string]any{
+			"approvalPolicy": cfg.Codex.ApprovalPolicy,
+			"sandbox":        threadSandboxValue(cfg.Codex.ThreadSandbox),
+			"cwd":            absWorkspace,
+			"dynamicTools": []map[string]any{{
+				"name":        "linear_graphql",
+				"description": "Execute one raw GraphQL operation against Linear using Symphony auth.",
+				"inputSchema": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"query":     map[string]any{"type": "string"},
+						"variables": map[string]any{"type": "object"},
+					},
+					"required": []string{"query"},
+				},
+			}},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	resp, err := s.awaitResponse(ctx, 2)
+	if err != nil {
+		return nil, err
+	}
+	thread, _ := resp["thread"].(map[string]any)
+	threadID, _ := thread["id"].(string)
+	if threadID == "" {
+		return nil, fmt.Errorf("response_error: missing thread id")
+	}
+	s.threadID = threadID
+	return s, nil
+}
+
+func startLocalTmuxSession(ctx context.Context, cfg config.Config, absWorkspace string, lc *linear.Client, logger *slog.Logger) (*Session, error) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		return nil, fmt.Errorf("tmux_not_found: %w", err)
+	}
+	sessionName := tmuxSessionName(cfg.Codex.TmuxSessionPrefix, filepath.Base(absWorkspace))
+	logDir := filepath.Join(absWorkspace, ".symphony")
+	stdinPath := filepath.Join(logDir, "codex-stdin.fifo")
+	stdoutPath := filepath.Join(logDir, "codex-stdout.log")
+	stderrPath := filepath.Join(logDir, "codex-stderr.log")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, err
+	}
+	_ = os.Remove(stdinPath)
+	if err := syscall.Mkfifo(stdinPath, 0o600); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(stdoutPath, nil, 0o644); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(stderrPath, nil, 0o644); err != nil {
+		return nil, err
+	}
+	_ = exec.CommandContext(ctx, "tmux", "kill-session", "-t", sessionName).Run()
+	shellCommand := "bash -lc " + shellQuote("exec "+cfg.Codex.Command+" <"+shellQuote(stdinPath)+" 2>>"+shellQuote(stderrPath))
+	cmd := exec.CommandContext(ctx, "tmux", "new-session", "-d", "-s", sessionName, "-c", absWorkspace, shellCommand)
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("tmux_session_start_failed: %w", err)
+	}
+	pipeCommand := "cat >> " + shellQuote(stdoutPath)
+	if err := exec.CommandContext(ctx, "tmux", "pipe-pane", "-o", "-t", sessionName, pipeCommand).Run(); err != nil {
+		_ = exec.CommandContext(ctx, "tmux", "kill-session", "-t", sessionName).Run()
+		return nil, fmt.Errorf("tmux_pipe_failed: %w", err)
+	}
+	pid := 0
+	if out, err := exec.CommandContext(ctx, "tmux", "display-message", "-p", "-t", sessionName, "#{pane_pid}").Output(); err == nil {
+		if parsed, parseOK := asInt(strings.TrimSpace(string(out))); parseOK {
+			pid = parsed
+		}
+	}
+	stdin, err := os.OpenFile(stdinPath, os.O_WRONLY, 0o600)
+	if err != nil {
+		_ = exec.CommandContext(ctx, "tmux", "kill-session", "-t", sessionName).Run()
+		return nil, fmt.Errorf("tmux_fifo_open_failed: %w", err)
+	}
+	s := &Session{
+		stdin:       stdin,
+		msgs:        make(chan map[string]any, 256),
+		errs:        make(chan error, 4),
+		cfg:         cfg,
+		logger:      logger,
+		linear:      lc,
+		workspace:   absWorkspace,
+		workerHost:  "",
+		pid:         pid,
+		tmuxSession: sessionName,
+		stopCh:      make(chan struct{}),
+	}
+	s.logger.Info("codex session configured",
+		"workspace", absWorkspace,
+		"worker_host", "local",
+		"tmux_session", s.tmuxSession,
+		"thread_sandbox", threadSandboxValue(cfg.Codex.ThreadSandbox),
+		"turn_sandbox_policy", jsonString(cfg.RuntimeSandboxPolicy(absWorkspace)),
+	)
+	go s.readStdoutFile(stdoutPath)
+	go s.readStderrFile(stderrPath)
+	go s.waitForTmuxExit(ctx)
 	if err := s.send(map[string]any{
 		"id":     1,
 		"method": "initialize",
@@ -165,12 +310,20 @@ func threadSandboxValue(value string) string {
 }
 
 func (s *Session) Stop() {
-	if s.stdin != nil {
-		_ = s.stdin.Close()
-	}
-	if s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
+	s.stopOnce.Do(func() {
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+		if s.stdin != nil {
+			_ = s.stdin.Close()
+		}
+		if s.tmuxSession != "" {
+			_ = exec.Command("tmux", "kill-session", "-t", s.tmuxSession).Run()
+		}
+		if s.cmd != nil && s.cmd.Process != nil {
+			_ = s.cmd.Process.Kill()
+		}
+	})
 }
 
 func (s *Session) RunTurn(ctx context.Context, prompt string, issue linear.Issue, onEvent func(Event)) (string, error) {
@@ -202,6 +355,7 @@ func (s *Session) RunTurn(ctx context.Context, prompt string, issue linear.Issue
 		Event:             "session_started",
 		Timestamp:         time.Now().UTC(),
 		CodexAppServerPID: s.pid,
+		TmuxSession:       s.tmuxSession,
 		SessionID:         sessionID,
 		ThreadID:          s.threadID,
 		TurnID:            turnID,
@@ -365,6 +519,7 @@ func (s *Session) eventFromMessage(name, sessionID, turnID string, msg map[strin
 		Event:             name,
 		Timestamp:         time.Now().UTC(),
 		CodexAppServerPID: s.pid,
+		TmuxSession:       s.tmuxSession,
 		SessionID:         sessionID,
 		ThreadID:          s.threadID,
 		TurnID:            turnID,
@@ -452,6 +607,12 @@ func asInt(v any) (int, bool) {
 		return int(t), true
 	case int:
 		return t, true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(t))
+		if err == nil {
+			return n, true
+		}
+		return 0, false
 	default:
 		return 0, false
 	}
@@ -520,6 +681,114 @@ func truncate(s string) string {
 		return s[:1000]
 	}
 	return s
+}
+
+func (s *Session) readStdoutFile(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		s.errs <- err
+		return
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			s.errs <- err
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(line), &payload); err != nil {
+			s.logger.Warn("malformed codex line", "payload", truncate(line))
+			continue
+		}
+		s.msgs <- payload
+	}
+}
+
+func (s *Session) readStderrFile(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		s.errs <- err
+		return
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			s.errs <- err
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		s.logger.Info("codex stderr", "tmux_session", s.tmuxSession, "line", truncate(line))
+	}
+}
+
+func (s *Session) waitForTmuxExit(ctx context.Context) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if exec.Command("tmux", "has-session", "-t", s.tmuxSession).Run() != nil {
+				s.errs <- nil
+				return
+			}
+		}
+	}
+}
+
+func tmuxSessionName(prefix, key string) string {
+	var b strings.Builder
+	for _, r := range prefix + "-" + key {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	name := strings.Trim(b.String(), "-")
+	if name == "" {
+		return "symphony-session"
+	}
+	return name
 }
 
 func shellQuote(s string) string {

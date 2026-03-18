@@ -19,6 +19,7 @@ type runningEntry struct {
 	startedAt    time.Time
 	lastEventAt  time.Time
 	sessionID    string
+	tmuxSession  string
 	lastEvent    string
 	lastMessage  string
 	turnCount    int
@@ -58,6 +59,17 @@ type Orchestrator struct {
 	codexTotals  tokenTotals
 	secondsEnded float64
 	rateLimits   map[string]any
+	lastPollAt   time.Time
+	lastPollErr  string
+	lastPollSeen int
+	cleanupState cleanupState
+}
+
+type cleanupState struct {
+	Running        bool      `json:"running"`
+	LastStartedAt  time.Time `json:"last_started_at"`
+	LastFinishedAt time.Time `json:"last_finished_at"`
+	LastError      string    `json:"last_error"`
 }
 
 func New(loader *config.Loader, logger *slog.Logger) (*Orchestrator, error) {
@@ -83,17 +95,21 @@ func New(loader *config.Loader, logger *slog.Logger) (*Orchestrator, error) {
 }
 
 func (o *Orchestrator) Run(ctx context.Context) error {
+	o.logger.Info("orchestrator starting", "workflow_path", o.cfg.Workflow.Path, "poll_interval", o.cfg.Polling.Interval.String())
 	_ = o.loader.Watch(ctx, func() {
 		if cfg, changed, err := o.loader.ReloadIfChanged(); err == nil && changed {
 			o.applyConfig(cfg)
 			o.logger.Info("workflow reloaded", "path", cfg.Workflow.Path)
 		}
 	})
-	o.cleanupTerminalWorkspaces(ctx)
+	o.startStartupCleanup(ctx)
 	ticker := time.NewTicker(o.cfg.Polling.Interval)
 	defer ticker.Stop()
+	o.logger.Info("poll tick starting", "reason", "startup")
 	if err := o.tick(ctx); err != nil {
 		o.logger.Error("initial tick failed", "error", err)
+	} else {
+		o.logger.Info("poll tick completed", "reason", "startup")
 	}
 	for {
 		select {
@@ -108,8 +124,11 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 			} else if err != nil {
 				o.logger.Error("workflow reload failed", "error", err)
 			}
+			o.logger.Info("poll tick starting", "reason", "interval")
 			if err := o.tick(ctx); err != nil {
 				o.logger.Error("poll tick failed", "error", err)
+			} else {
+				o.logger.Info("poll tick completed", "reason", "interval")
 			}
 		case result := <-o.results:
 			o.handleResult(result)
@@ -123,16 +142,22 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 }
 
 func (o *Orchestrator) tick(ctx context.Context) error {
+	pollAt := time.Now().UTC()
 	o.reconcile(ctx)
 	if err := config.Validate(o.cfg); err != nil {
+		o.recordPoll(pollAt, 0, err)
 		return err
 	}
 	issues, err := o.linear.FetchCandidateIssues(ctx)
 	if err != nil {
+		o.recordPoll(pollAt, 0, err)
 		return err
 	}
+	o.recordPoll(pollAt, len(issues), nil)
+	o.logger.Info("poll candidates fetched", "count", len(issues))
 	for _, issue := range issues {
 		if o.availableSlots() <= 0 {
+			o.logger.Info("issue skipped", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "reason", "no_available_slots")
 			break
 		}
 		_ = o.dispatch(ctx, issue, nil)
@@ -141,11 +166,13 @@ func (o *Orchestrator) tick(ctx context.Context) error {
 }
 
 func (o *Orchestrator) dispatch(ctx context.Context, issue linear.Issue, attempt *int) error {
-	if !o.eligible(issue) {
+	if ok, reason := o.eligibleWithReason(issue, false); !ok {
+		o.logger.Info("issue skipped", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "state", issue.State, "reason", reason)
 		return nil
 	}
 	workerHost := o.selectWorkerHost("")
 	if workerHost == ":no_worker_capacity" {
+		o.logger.Info("issue skipped", "issue_id", issue.ID, "issue_identifier", issue.Identifier, "state", issue.State, "reason", "no_worker_capacity")
 		return nil
 	}
 	o.mu.Lock()
@@ -173,20 +200,29 @@ func (o *Orchestrator) dispatch(ctx context.Context, issue linear.Issue, attempt
 }
 
 func (o *Orchestrator) eligible(issue linear.Issue) bool {
-	return o.eligibleWithClaim(issue, false)
+	ok, _ := o.eligibleWithReason(issue, false)
+	return ok
 }
 
 func (o *Orchestrator) eligibleWithClaim(issue linear.Issue, allowClaimed bool) bool {
+	ok, _ := o.eligibleWithReason(issue, allowClaimed)
+	return ok
+}
+
+func (o *Orchestrator) eligibleWithReason(issue linear.Issue, allowClaimed bool) (bool, string) {
 	if issue.ID == "" || issue.Identifier == "" || issue.Title == "" || issue.State == "" {
-		return false
+		return false, "invalid_issue"
 	}
 	if !isActive(o.cfg, issue.State) || isTerminal(o.cfg, issue.State) {
-		return false
+		if isTerminal(o.cfg, issue.State) {
+			return false, "terminal_state"
+		}
+		return false, "inactive_state"
 	}
 	if strings.EqualFold(issue.State, "Todo") {
 		for _, blocker := range issue.BlockedBy {
 			if !isTerminal(o.cfg, blocker.State) {
-				return false
+				return false, "blocked_by_open_dependency"
 			}
 		}
 	}
@@ -194,17 +230,17 @@ func (o *Orchestrator) eligibleWithClaim(issue linear.Issue, allowClaimed bool) 
 	defer o.mu.Unlock()
 	if !allowClaimed {
 		if _, ok := o.claimed[issue.ID]; ok {
-			return false
+			return false, "already_claimed"
 		}
 	}
 	if _, ok := o.running[issue.ID]; ok {
-		return false
+		return false, "already_running"
 	}
 	if o.availableSlotsLocked() <= 0 {
-		return false
+		return false, "no_available_slots"
 	}
 	if !o.workerSlotsAvailableLocked("") {
-		return false
+		return false, "no_worker_capacity"
 	}
 	stateLimit := o.cfg.MaxConcurrentForState(issue.State)
 	if stateLimit > 0 {
@@ -215,10 +251,10 @@ func (o *Orchestrator) eligibleWithClaim(issue linear.Issue, allowClaimed bool) 
 			}
 		}
 		if count >= stateLimit {
-			return false
+			return false, "state_concurrency_limit"
 		}
 	}
-	return true
+	return true, ""
 }
 
 func (o *Orchestrator) reconcile(ctx context.Context) {
@@ -278,6 +314,9 @@ func (o *Orchestrator) integrateEvent(issueID string, event agent.Event) {
 	entry.lastMessage = event.Message
 	if event.SessionID != "" {
 		entry.sessionID = event.SessionID
+	}
+	if event.TmuxSession != "" {
+		entry.tmuxSession = event.TmuxSession
 	}
 	if event.Event == "session_started" {
 		entry.turnCount++
@@ -407,11 +446,11 @@ func (o *Orchestrator) rescheduleRetry(issue linear.Issue, attempt int, message 
 	o.fireRetry(retry)
 }
 
-func (o *Orchestrator) cleanupTerminalWorkspaces(ctx context.Context) {
+func (o *Orchestrator) cleanupTerminalWorkspaces(ctx context.Context) error {
 	issues, err := o.linear.FetchIssuesByStates(ctx, o.cfg.Tracker.TerminalStates)
 	if err != nil {
 		o.logger.Warn("startup terminal workspace cleanup skipped", "error", err)
-		return
+		return err
 	}
 	for _, issue := range issues {
 		_ = o.workspaces.Remove(ctx, issue.Identifier, "")
@@ -419,6 +458,45 @@ func (o *Orchestrator) cleanupTerminalWorkspaces(ctx context.Context) {
 			_ = o.workspaces.Remove(ctx, issue.Identifier, host)
 		}
 	}
+	return nil
+}
+
+func (o *Orchestrator) startStartupCleanup(ctx context.Context) {
+	timeout := o.cfg.Hooks.Timeout
+	if timeout < 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	o.mu.Lock()
+	o.cleanupState.Running = true
+	o.cleanupState.LastStartedAt = time.Now().UTC()
+	o.cleanupState.LastError = ""
+	o.mu.Unlock()
+	o.logger.Info("startup cleanup starting", "timeout", timeout.String())
+	go func() {
+		cleanupCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		err := o.cleanupTerminalWorkspaces(cleanupCtx)
+		o.mu.Lock()
+		o.cleanupState.Running = false
+		o.cleanupState.LastFinishedAt = time.Now().UTC()
+		switch {
+		case err != nil:
+			o.cleanupState.LastError = err.Error()
+		case cleanupCtx.Err() == context.DeadlineExceeded:
+			o.cleanupState.LastError = cleanupCtx.Err().Error()
+		}
+		lastErr := o.cleanupState.LastError
+		o.mu.Unlock()
+		o.logger.Info("startup cleanup finished", "error", lastErr)
+	}()
+}
+
+func (o *Orchestrator) recordPoll(at time.Time, count int, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.lastPollAt = at
+	o.lastPollSeen = count
+	o.lastPollErr = errString(err)
 }
 
 func (o *Orchestrator) fireRetry(retry retryEntry) {
@@ -539,6 +617,7 @@ func (o *Orchestrator) Snapshot() map[string]any {
 			"issue_identifier": entry.issue.Identifier,
 			"state":            entry.issue.State,
 			"session_id":       entry.sessionID,
+			"tmux_session":     entry.tmuxSession,
 			"turn_count":       entry.turnCount,
 			"last_event":       entry.lastEvent,
 			"last_message":     entry.lastMessage,
@@ -580,6 +659,17 @@ func (o *Orchestrator) Snapshot() map[string]any {
 			"output_tokens":   o.codexTotals.Output,
 			"total_tokens":    o.codexTotals.Total,
 			"seconds_running": secondsRunning,
+		},
+		"scheduler": map[string]any{
+			"last_poll_at":              formatTime(o.lastPollAt),
+			"last_poll_candidate_count": o.lastPollSeen,
+			"last_poll_error":           o.lastPollErr,
+			"startup_cleanup": map[string]any{
+				"running":          o.cleanupState.Running,
+				"last_started_at":  formatTime(o.cleanupState.LastStartedAt),
+				"last_finished_at": formatTime(o.cleanupState.LastFinishedAt),
+				"last_error":       o.cleanupState.LastError,
+			},
 		},
 		"rate_limits": o.rateLimits,
 	}
@@ -658,4 +748,11 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }

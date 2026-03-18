@@ -62,9 +62,20 @@ docker run --rm \
 
 Important:
 
-- The provided image contains the Symphony binary, `bash`, `git`, and `ssh`, but not the Codex CLI.
+- The provided image contains the Symphony binary, `bash`, `git`, `ssh`, `tmux`, and `gh`, but not the Codex CLI.
 - The recommended local-dev path is the launcher script below, which mounts your host-installed
   Codex package into the container and runs it with the container's Node runtime.
+- The launcher configures Codex with `danger-full-access` inside Docker because Codex's internal
+  workspace sandbox can fail under container namespace restrictions. This is Docker-only; the Go
+  runtime default outside Docker remains `workspaceWrite`.
+- The launcher also configures per-issue `tmux` sessions so you can attach to a running agent from
+  inside the container.
+- If `GH_TOKEN` is set, the launcher passes it into the container and configures `gh`/git for
+  non-interactive HTTPS GitHub operations from the issue workspace.
+- The launcher auto-loads `.env` from the target project and the repo root, and it accepts
+  `LINEAR_API_TOKEN` as a fallback alias for `LINEAR_API_KEY`.
+- Generated workflows require repo-tracked deliverables for every issue. Non-code work is stored
+  under `deliverables/<ISSUE_IDENTIFIER>/`, pushed on a feature branch, and reviewed before merge.
 - If you do not want the container itself to host Codex, use `worker.ssh_hosts` so the container
   orchestrates work while remote workers run `codex app-server`.
 
@@ -75,8 +86,15 @@ to point Symphony at a local project path, generate `.symphony/WORKFLOW.md`, bui
 needed, and start a container:
 
 ```bash
-export LINEAR_API_KEY=...
 ./go/scripts/run-project-in-docker.sh /path/to/your/project
+```
+
+If you prefer env files, put credentials in `.env` as either:
+
+```bash
+LINEAR_API_KEY=...
+# or LINEAR_API_TOKEN=...
+GH_TOKEN=...
 ```
 
 Optional flags:
@@ -84,5 +102,16 @@ Optional flags:
 - `--linear-project-slug your-linear-slug`
 - `--port 4110`
 - `--container-name symphony-my-project`
+- `--require-gh-token`
 - `--force`
 - `--build`
+
+Useful Docker operator commands:
+
+```bash
+docker logs -f symphony-my-project
+docker exec symphony-my-project tmux ls
+docker exec -it symphony-my-project tmux attach -t symphony-wig-28
+docker exec symphony-my-project gh auth status
+curl -sS http://127.0.0.1:4110/api/v1/state
+```

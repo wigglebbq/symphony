@@ -9,8 +9,10 @@ FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
+    gh \
     git \
     openssh-client \
+    tmux \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 COPY --from=build /out/symphony /usr/local/bin/symphony

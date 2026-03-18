@@ -11,6 +11,7 @@ Options:
   --port PORT                  HTTP port to expose. Defaults to a deterministic port per project.
   --container-name NAME        Docker container name. Defaults to symphony-<project>.
   --image NAME                 Docker image tag. Defaults to symphony-go.
+  --require-gh-token           Fail if GH_TOKEN is not set.
   --force                      Overwrite an existing generated .symphony/WORKFLOW.md.
   --build                      Force a docker rebuild even if the image already exists.
   -h, --help                   Show this help.
@@ -19,6 +20,44 @@ EOF
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+load_dotenv_file() {
+  local path="$1"
+  [[ -f "${path}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" || "${line}" == \#* ]] && continue
+    [[ "${line}" == export\ * ]] && line="${line#export }"
+    if [[ "${line}" != *=* ]]; then
+      continue
+    fi
+    local key="${line%%=*}"
+    local value="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"
+    key="${key#"${key%%[![:space:]]*}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${value}" =~ ^\".*\"$ ]] || [[ "${value}" =~ ^\'.*\'$ ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    if [[ -z "${!key:-}" ]]; then
+      export "${key}=${value}"
+    fi
+  done < "${path}"
+}
+
+normalize_env_aliases() {
+  if [[ -z "${LINEAR_API_KEY:-}" && -n "${LINEAR_API_TOKEN:-}" ]]; then
+    export LINEAR_API_KEY="${LINEAR_API_TOKEN}"
+  fi
+  if [[ -z "${GH_TOKEN:-}" && -n "${GITHUB_TOKEN:-}" ]]; then
+    export GH_TOKEN="${GITHUB_TOKEN}"
+  fi
+  if [[ -z "${GITHUB_TOKEN:-}" && -n "${GH_TOKEN:-}" ]]; then
+    export GITHUB_TOKEN="${GH_TOKEN}"
+  fi
+}
 
 resolve_linear_project_slug_id() {
   local requested="$1"
@@ -87,6 +126,7 @@ LINEAR_PROJECT_SLUG=""
 PORT=""
 CONTAINER_NAME=""
 IMAGE_NAME="symphony-go"
+REQUIRE_GH_TOKEN=0
 FORCE=0
 FORCE_BUILD=0
 
@@ -107,6 +147,10 @@ while [[ $# -gt 0 ]]; do
     --image)
       IMAGE_NAME="${2:-}"
       shift 2
+      ;;
+    --require-gh-token)
+      REQUIRE_GH_TOKEN=1
+      shift
       ;;
     --force)
       FORCE=1
@@ -147,8 +191,17 @@ if [[ ! -d "${PROJECT_PATH}" ]]; then
   exit 1
 fi
 
+load_dotenv_file "${PROJECT_PATH}/.env"
+load_dotenv_file "${GO_DIR}/../.env"
+normalize_env_aliases
+
 if [[ -z "${LINEAR_API_KEY:-}" ]]; then
   echo "LINEAR_API_KEY must be set in the environment." >&2
+  exit 1
+fi
+
+if [[ "${REQUIRE_GH_TOKEN}" -eq 1 ]] && [[ -z "${GH_TOKEN:-}" ]]; then
+  echo "GH_TOKEN must be set in the environment when --require-gh-token is used." >&2
   exit 1
 fi
 
@@ -172,6 +225,7 @@ SANITIZED_NAME="$(printf '%s' "${PROJECT_NAME}" | tr '[:upper:]' '[:lower:]' | t
 SANITIZED_NAME="${SANITIZED_NAME#-}"
 SANITIZED_NAME="${SANITIZED_NAME%-}"
 SOURCE_BRANCH="$(git -C "${PROJECT_PATH}" symbolic-ref --short HEAD 2>/dev/null || printf 'main')"
+ORIGIN_URL="$(git -C "${PROJECT_PATH}" remote get-url origin 2>/dev/null || true)"
 
 if [[ -z "${LINEAR_PROJECT_SLUG}" ]]; then
   LINEAR_PROJECT_SLUG="${SANITIZED_NAME}"
@@ -198,6 +252,8 @@ if [[ ! -d "${CODEX_AUTH_DIR}" ]]; then
   echo "Expected Codex auth directory at ${CODEX_AUTH_DIR}." >&2
   exit 1
 fi
+
+echo "Using auth inputs: linear_api_key_present=$([[ -n "${LINEAR_API_KEY:-}" ]] && echo true || echo false) gh_token_present=$([[ -n "${GH_TOKEN:-}" ]] && echo true || echo false)"
 
 STATE_DIR="${PROJECT_PATH}/.symphony"
 WORKFLOW_PATH="${STATE_DIR}/WORKFLOW.md"
@@ -260,22 +316,43 @@ workspace:
 hooks:
   after_create: |
     git init .
+    git config user.name "\${SYMPHONY_GIT_NAME:-Symphony Bot}" >/dev/null
+    git config user.email "\${SYMPHONY_GIT_EMAIL:-symphony@example.invalid}" >/dev/null
+    if [ -n "${ORIGIN_URL}" ]; then
+      git remote remove origin >/dev/null 2>&1 || true
+      git remote add origin ${ORIGIN_URL}
+    fi
     git remote remove source >/dev/null 2>&1 || true
     git remote add source /source
     git fetch source ${SOURCE_BRANCH} --depth=1
     git checkout -B ${SOURCE_BRANCH} source/${SOURCE_BRANCH}
+    if command -v gh >/dev/null 2>&1 && [ -n "\${GH_TOKEN:-}" ]; then
+      gh auth setup-git >/dev/null 2>&1 || true
+    fi
   before_run: |
     if [ -d .git ]; then
+      git config user.name "\${SYMPHONY_GIT_NAME:-Symphony Bot}" >/dev/null
+      git config user.email "\${SYMPHONY_GIT_EMAIL:-symphony@example.invalid}" >/dev/null
+      if [ -n "${ORIGIN_URL}" ]; then
+        git remote add origin ${ORIGIN_URL} >/dev/null 2>&1 || git remote set-url origin ${ORIGIN_URL}
+      fi
       git remote remove source >/dev/null 2>&1 || true
       git remote add source /source >/dev/null 2>&1 || git remote set-url source /source
       git fetch source ${SOURCE_BRANCH} --prune || true
       git checkout -B ${SOURCE_BRANCH} source/${SOURCE_BRANCH} >/dev/null 2>&1 || true
+      if command -v gh >/dev/null 2>&1 && [ -n "\${GH_TOKEN:-}" ]; then
+        gh auth setup-git >/dev/null 2>&1 || true
+      fi
     fi
 agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
   command: node /opt/codex/bin/codex.js app-server
+  thread_sandbox: danger-full-access
+  tmux_session_prefix: symphony
+  turn_sandbox_policy:
+    type: danger-full-access
 server:
   port: ${PORT}
   host: 0.0.0.0
@@ -293,13 +370,26 @@ No description provided.
 {% endif %}
 
 Execution rules:
-- Read the relevant project files first before acting.
+- Read the relevant project files first before acting, especially docs/ and any existing deliverables/ content from main.
 - You can use the dynamic tool linear_graphql to read from and write to Linear.
-- If the issue asks for planning, backlog creation, research synthesis, or project management work, do that work in Linear rather than only in the repo.
-- For planning/backlog tasks, create the necessary Linear issues directly, capture dependencies/priorities when possible, and leave a comment on the current issue summarizing what you created.
-- If the issue asks for code changes, make those changes in this workspace and leave the repo in a coherent state.
+- If GH_TOKEN is available in the environment, you may use git and gh non-interactively against the repo origin.
+- Every ticket must leave repo-tracked output. Write issue-scoped artifacts under deliverables/{{ issue.identifier }}/.
+- For non-coding tickets, the repo deliverable is required. Examples include plan.md, research.md, backlog.md, summary.md, decision-log.md, or review-summary.md as appropriate.
+- For coding tickets, make the code changes and also add any supporting issue-scoped notes under deliverables/{{ issue.identifier }}/ when useful.
+- Create and work from an issue-scoped feature branch, not main. Use a branch name derived from the issue identifier.
+- Before finishing, stage your repo changes, create a commit, and push the feature branch to origin. If push fails, leave the exact failure in a Linear comment.
+- Coding tickets use the same review-and-merge flow as non-coding tickets. A coding ticket is not complete until its feature branch has gone through review and has been merged to main.
+- If the issue asks for planning, backlog creation, research synthesis, or project management work, do that work in Linear and also persist the results under deliverables/{{ issue.identifier }}/ in the repo.
+- For planning/backlog tasks, create the necessary Linear issues directly, capture dependencies/priorities when possible, and leave a comment on the current issue summarizing what you created and where the repo deliverables live.
+- Review workflow:
+- For normal work issues, after pushing your branch create or update a pull request with gh and create or update a paired Linear review issue titled REVIEW: {{ issue.identifier }} {{ issue.title }}. Put the branch name, PR URL, source issue identifier, and current review round in the review issue description or a comment.
+- This applies equally to coding tickets and non-coding tickets. Worker agents push branches and open/update PRs; they do not self-merge.
+- For review issues whose title starts with REVIEW:, act as the reviewer/integration agent. Review the source branch and PR, leave concrete review comments, and request changes if needed.
+- The review loop is capped at 2 rounds. On the second review round, approve, merge to main, and leave a concise residual-risk summary in Linear and in deliverables/{{ issue.identifier }}/review-summary.md if there are remaining concerns.
+- Downstream tickets should treat main as the canonical source for prior deliverables, not unmerged feature branches.
 - Do not end a turn having done only private analysis. Produce externally visible progress each turn: repo changes, Linear issue creation/updates, or a comment explaining a concrete blocker.
 - If the docs are incomplete or ambiguous, create explicit follow-up issues in Linear for the missing decisions instead of silently stopping.
+- Use files from the cloned issue workspace as the source of truth before assuming repo docs are inaccessible.
 EOF
 
 if [[ "${FORCE_BUILD}" -eq 1 ]] || ! docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
@@ -313,7 +403,11 @@ fi
 docker run -d \
   --name "${CONTAINER_NAME}" \
   -p "${PORT}:${PORT}" \
+  -e GH_TOKEN="${GH_TOKEN:-}" \
+  -e GITHUB_TOKEN="${GITHUB_TOKEN:-}" \
   -e LINEAR_API_KEY="${LINEAR_API_KEY}" \
+  -e SYMPHONY_GIT_NAME="${SYMPHONY_GIT_NAME:-Symphony Bot}" \
+  -e SYMPHONY_GIT_EMAIL="${SYMPHONY_GIT_EMAIL:-symphony@example.invalid}" \
   -v "${PROJECT_PATH}:/project" \
   -v "${PROJECT_PATH}:/source:ro" \
   -v "${CODEX_PACKAGE_ROOT}:/opt/codex:ro" \
@@ -333,5 +427,8 @@ State API:    http://127.0.0.1:${PORT}/api/v1/state
 
 Useful commands:
   docker logs -f ${CONTAINER_NAME}
+  docker exec ${CONTAINER_NAME} tmux ls
+  docker exec -it ${CONTAINER_NAME} tmux attach -t symphony-<lowercased-issue-identifier>
+  docker exec ${CONTAINER_NAME} gh auth status
   docker rm -f ${CONTAINER_NAME}
 EOF

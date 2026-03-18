@@ -70,3 +70,10 @@ func TestToolCallCanUseToolKey(t *testing.T) {
 		t.Fatalf("expected tool key to be available, got %q", tool)
 	}
 }
+
+func TestTmuxSessionNameSanitizesIssueIdentifier(t *testing.T) {
+	got := tmuxSessionName("symphony", "WIG-28/Docs Audit")
+	if got != "symphony-wig-28-docs-audit" {
+		t.Fatalf("unexpected tmux session name: %q", got)
+	}
+}
