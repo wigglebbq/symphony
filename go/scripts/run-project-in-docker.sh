@@ -378,14 +378,13 @@ Execution rules:
 - For coding tickets, make the code changes and also add any supporting issue-scoped notes under deliverables/{{ issue.identifier }}/ when useful.
 - Create and work from an issue-scoped feature branch, not main. Use a branch name derived from the issue identifier.
 - Before finishing, stage your repo changes, create a commit, and push the feature branch to origin. If push fails, leave the exact failure in a Linear comment.
-- Coding tickets use the same review-and-merge flow as non-coding tickets. A coding ticket is not complete until its feature branch has gone through review and has been merged to main.
 - If the issue asks for planning, backlog creation, research synthesis, or project management work, do that work in Linear and also persist the results under deliverables/{{ issue.identifier }}/ in the repo.
 - For planning/backlog tasks, create the necessary Linear issues directly, capture dependencies/priorities when possible, and leave a comment on the current issue summarizing what you created and where the repo deliverables live.
-- Review workflow:
-- For normal work issues, after pushing your branch create or update a pull request with gh and create or update a paired Linear review issue titled REVIEW: {{ issue.identifier }} {{ issue.title }}. Put the branch name, PR URL, source issue identifier, and current review round in the review issue description or a comment.
-- This applies equally to coding tickets and non-coding tickets. Worker agents push branches and open/update PRs; they do not self-merge.
-- For review issues whose title starts with REVIEW:, act as the reviewer/integration agent. Review the source branch and PR, leave concrete review comments, and request changes if needed.
-- The review loop is capped at 2 rounds. On the second review round, approve, merge to main, and leave a concise residual-risk summary in Linear and in deliverables/{{ issue.identifier }}/review-summary.md if there are remaining concerns.
+- Symphony runtime owns PR creation/discovery, review-ticket creation, GitHub-to-Linear status sync, and merge-state bookkeeping when those actions are deterministic.
+- For normal work issues, focus on the substantive work. Push the branch when you have a real deliverable; you do not need to create or update the PR or the review ticket yourself unless the runtime cannot do it.
+- For review issues whose title starts with REVIEW:, review the linked source branch and source PR. Do not create a new branch or PR for the review ticket itself.
+- For review issues, the required deliverable is a real GitHub review on the linked source PR. Before finishing the review, submit a review with gh such as 'gh pr review PR_NUMBER --approve --body "..."' or 'gh pr review PR_NUMBER --request-changes --body "..."' when the source PR is ready for a decision. Use 'gh pr review PR_NUMBER --comment --body "..."' only when you genuinely cannot make an approval decision yet.
+- Review tickets should produce review work, not workflow bookkeeping. Only write repo artifacts for the review ticket if they are genuine review deliverables.
 - Downstream tickets should treat main as the canonical source for prior deliverables, not unmerged feature branches.
 - Do not end a turn having done only private analysis. Produce externally visible progress each turn: repo changes, Linear issue creation/updates, or a comment explaining a concrete blocker.
 - If the docs are incomplete or ambiguous, create explicit follow-up issues in Linear for the missing decisions instead of silently stopping.

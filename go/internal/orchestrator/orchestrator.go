@@ -9,6 +9,7 @@ import (
 
 	"github.com/openai/symphony/go/internal/agent"
 	"github.com/openai/symphony/go/internal/config"
+	githubclient "github.com/openai/symphony/go/internal/github"
 	"github.com/openai/symphony/go/internal/linear"
 	"github.com/openai/symphony/go/internal/workspace"
 )
@@ -28,6 +29,7 @@ type runningEntry struct {
 	cancel       context.CancelFunc
 	workspace    string
 	workerHost   string
+	workflow     workflowInfo
 }
 
 type retryEntry struct {
@@ -50,6 +52,7 @@ type Orchestrator struct {
 	linear       *linear.Client
 	workspaces   *workspace.Manager
 	runner       *agent.Runner
+	github       *githubclient.Client
 	results      chan agent.RunResult
 	retryCh      chan retryEntry
 	mu           sync.Mutex
@@ -63,6 +66,7 @@ type Orchestrator struct {
 	lastPollErr  string
 	lastPollSeen int
 	cleanupState cleanupState
+	workflow     map[string]workflowInfo
 }
 
 type cleanupState struct {
@@ -86,11 +90,13 @@ func New(loader *config.Loader, logger *slog.Logger) (*Orchestrator, error) {
 		linear:     lc,
 		workspaces: wm,
 		runner:     agent.NewRunner(cfg, lc, wm, logger),
+		github:     githubclient.NewClient(),
 		results:    make(chan agent.RunResult, 128),
 		retryCh:    make(chan retryEntry, 128),
 		running:    map[string]*runningEntry{},
 		claimed:    map[string]struct{}{},
 		retrying:   map[string]retryEntry{},
+		workflow:   map[string]workflowInfo{},
 	}, nil
 }
 
@@ -153,6 +159,7 @@ func (o *Orchestrator) tick(ctx context.Context) error {
 		o.recordPoll(pollAt, 0, err)
 		return err
 	}
+	o.syncWorkflowState(ctx, issues)
 	o.recordPoll(pollAt, len(issues), nil)
 	o.logger.Info("poll candidates fetched", "count", len(issues))
 	for _, issue := range issues {
@@ -187,6 +194,7 @@ func (o *Orchestrator) dispatch(ctx context.Context, issue linear.Issue, attempt
 		cancel:      cancel,
 		workspace:   workspacePath,
 		workerHost:  workerHost,
+		workflow:    o.workflow[issue.ID],
 	}
 	o.mu.Unlock()
 	go func() {
@@ -228,6 +236,9 @@ func (o *Orchestrator) eligibleWithReason(issue linear.Issue, allowClaimed bool)
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if info, ok := o.workflow[issue.ID]; ok && info.SuppressDispatch {
+		return false, info.SkipReason
+	}
 	if !allowClaimed {
 		if _, ok := o.claimed[issue.ID]; ok {
 			return false, "already_claimed"
@@ -365,6 +376,23 @@ func (o *Orchestrator) handleResult(result agent.RunResult) {
 		delete(o.running, result.Issue.ID)
 	}
 	if result.Err == nil && result.NormalExit {
+		o.mu.Unlock()
+		action := postRunRetry
+		if entry != nil {
+			syncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			action = o.evaluatePostRun(syncCtx, result.Issue, entry.workspace)
+			cancel()
+		}
+		switch action {
+		case postRunComplete, postRunWait:
+			o.mu.Lock()
+			delete(o.claimed, result.Issue.ID)
+			delete(o.retrying, result.Issue.ID)
+			o.mu.Unlock()
+			o.logger.Info("agent completed", "issue_id", result.Issue.ID, "issue_identifier", result.Issue.Identifier, "session_id", result.SessionID, "action", actionString(action))
+			return
+		}
+		o.mu.Lock()
 		retry := retryEntry{issue: result.Issue, attempt: 1, dueAt: time.Now().UTC().Add(time.Second)}
 		o.retrying[result.Issue.ID] = retry
 		o.mu.Unlock()
@@ -426,6 +454,7 @@ func (o *Orchestrator) dispatchRetry(ctx context.Context, issue linear.Issue, at
 		cancel:      cancel,
 		workspace:   workspacePath,
 		workerHost:  workerHost,
+		workflow:    o.workflow[issue.ID],
 	}
 	o.mu.Unlock()
 	go func() {
@@ -574,6 +603,17 @@ func (o *Orchestrator) selectWorkerHostLocked(preferred string) string {
 	return best
 }
 
+func actionString(action postRunAction) string {
+	switch action {
+	case postRunWait:
+		return "wait"
+	case postRunComplete:
+		return "complete"
+	default:
+		return "retry"
+	}
+}
+
 func (o *Orchestrator) workerSlotsAvailableLocked(preferred string) bool {
 	return o.selectWorkerHostLocked(preferred) != ":no_worker_capacity"
 }
@@ -625,6 +665,23 @@ func (o *Orchestrator) Snapshot() map[string]any {
 			"last_event_at":    entry.lastEventAt.Format(time.RFC3339),
 			"workspace":        entry.workspace,
 			"worker_host":      workerHostValue(entry.workerHost),
+			"workflow": map[string]any{
+				"role":                    entry.workflow.Role,
+				"state":                   entry.workflow.WorkflowState,
+				"completion_gate":         entry.workflow.CompletionGate,
+				"source_issue_id":         entry.workflow.SourceIssueID,
+				"source_issue_identifier": entry.workflow.SourceIssueIdentifier,
+				"review_issue_id":         entry.workflow.ReviewIssueID,
+				"review_issue_identifier": entry.workflow.ReviewIssueIdentifier,
+				"branch":                  entry.workflow.Branch,
+				"pr_number":               entry.workflow.PRNumber,
+				"pr_url":                  entry.workflow.PRURL,
+				"github_state":            entry.workflow.GitHubState,
+				"review_decision":         entry.workflow.ReviewDecision,
+				"review_round":            entry.workflow.ReviewRound,
+				"last_sync_at":            formatTime(entry.workflow.LastSyncAt),
+				"last_sync_error":         entry.workflow.LastSyncError,
+			},
 			"tokens": map[string]any{
 				"input_tokens":  entry.tokens.Input,
 				"output_tokens": entry.tokens.Output,

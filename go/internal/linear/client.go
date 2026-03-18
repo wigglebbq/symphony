@@ -29,10 +29,13 @@ type Issue struct {
 	Description string       `json:"description,omitempty"`
 	Priority    *int         `json:"priority,omitempty"`
 	State       string       `json:"state"`
+	StateID     string       `json:"state_id,omitempty"`
 	BranchName  string       `json:"branch_name,omitempty"`
 	URL         string       `json:"url,omitempty"`
 	Labels      []string     `json:"labels,omitempty"`
 	BlockedBy   []BlockerRef `json:"blocked_by,omitempty"`
+	ProjectID   string       `json:"project_id,omitempty"`
+	TeamID      string       `json:"team_id,omitempty"`
 	CreatedAt   *time.Time   `json:"created_at,omitempty"`
 	UpdatedAt   *time.Time   `json:"updated_at,omitempty"`
 }
@@ -152,6 +155,127 @@ func (c *Client) FetchIssueStatesByIDs(ctx context.Context, ids []string) ([]Iss
 	return out, nil
 }
 
+func (c *Client) FindIssueByIdentifier(ctx context.Context, identifier string) (*Issue, error) {
+	if strings.TrimSpace(identifier) == "" {
+		return nil, nil
+	}
+	payload, err := c.graphql(ctx, issueByIdentifierQuery, map[string]any{"identifier": identifier})
+	if err != nil {
+		return nil, err
+	}
+	issuesNode, ok := digMap(payload, "data", "issues")
+	if !ok {
+		return nil, fmt.Errorf("linear_unknown_payload")
+	}
+	nodes := sliceMap(issuesNode["nodes"])
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	issue, ok := normalizeIssue(nodes[0])
+	if !ok {
+		return nil, nil
+	}
+	return &issue, nil
+}
+
+func (c *Client) FindIssueByTitle(ctx context.Context, title string) (*Issue, error) {
+	if strings.TrimSpace(title) == "" {
+		return nil, nil
+	}
+	payload, err := c.graphql(ctx, issueByTitleQuery, map[string]any{
+		"projectSlug": c.cfg.Tracker.ProjectSlug,
+		"title":       title,
+	})
+	if err != nil {
+		return nil, err
+	}
+	issuesNode, ok := digMap(payload, "data", "issues")
+	if !ok {
+		return nil, fmt.Errorf("linear_unknown_payload")
+	}
+	nodes := sliceMap(issuesNode["nodes"])
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	issue, ok := normalizeIssue(nodes[0])
+	if !ok {
+		return nil, nil
+	}
+	return &issue, nil
+}
+
+func (c *Client) CreateIssue(ctx context.Context, source Issue, title, description, stateName string) (*Issue, error) {
+	stateID, err := c.stateIDForIssue(ctx, source, stateName)
+	if err != nil {
+		return nil, err
+	}
+	input := map[string]any{
+		"title":       title,
+		"description": description,
+		"teamId":      source.TeamID,
+		"projectId":   source.ProjectID,
+	}
+	if stateID != "" {
+		input["stateId"] = stateID
+	}
+	payload, err := c.graphql(ctx, issueCreateMutation, map[string]any{"input": input})
+	if err != nil {
+		return nil, err
+	}
+	issueNode, ok := digMap(payload, "data", "issueCreate", "issue")
+	if !ok {
+		return nil, fmt.Errorf("linear_unknown_payload")
+	}
+	issue, ok := normalizeIssue(issueNode)
+	if !ok {
+		return nil, fmt.Errorf("linear_unknown_payload")
+	}
+	return &issue, nil
+}
+
+func (c *Client) UpdateIssueState(ctx context.Context, issue Issue, stateName string) error {
+	stateID, err := c.stateIDForIssue(ctx, issue, stateName)
+	if err != nil {
+		return err
+	}
+	if stateID == "" {
+		return fmt.Errorf("linear_state_not_found")
+	}
+	_, err = c.graphql(ctx, issueUpdateMutation, map[string]any{
+		"id": issue.ID,
+		"input": map[string]any{
+			"stateId": stateID,
+		},
+	})
+	return err
+}
+
+func (c *Client) UpdateIssueDescription(ctx context.Context, issueID, description string) error {
+	if strings.TrimSpace(issueID) == "" {
+		return fmt.Errorf("missing_issue_id")
+	}
+	_, err := c.graphql(ctx, issueUpdateMutation, map[string]any{
+		"id": issueID,
+		"input": map[string]any{
+			"description": description,
+		},
+	})
+	return err
+}
+
+func (c *Client) CreateComment(ctx context.Context, issueID, body string) error {
+	if strings.TrimSpace(issueID) == "" || strings.TrimSpace(body) == "" {
+		return nil
+	}
+	_, err := c.graphql(ctx, commentCreateMutation, map[string]any{
+		"input": map[string]any{
+			"issueId": issueID,
+			"body":    body,
+		},
+	})
+	return err
+}
+
 func (c *Client) GraphQL(ctx context.Context, query string, variables map[string]any) (map[string]any, error) {
 	return c.graphql(ctx, query, variables)
 }
@@ -240,10 +364,13 @@ func normalizeIssue(node map[string]any) (Issue, bool) {
 		Title:       title,
 		Description: stringOrEmpty(node["description"]),
 		State:       state,
+		StateID:     stringOrEmpty(stateNode["id"]),
 		BranchName:  stringOrEmpty(node["branchName"]),
 		URL:         stringOrEmpty(node["url"]),
 		Labels:      normalizeLabels(node),
 		BlockedBy:   normalizeBlockedBy(node),
+		ProjectID:   nestedID(node, "project"),
+		TeamID:      nestedID(node, "team"),
 		CreatedAt:   parseTime(node["createdAt"]),
 		UpdatedAt:   parseTime(node["updatedAt"]),
 	}
@@ -358,6 +485,36 @@ func parseTime(v any) *time.Time {
 	return &t
 }
 
+func nestedID(node map[string]any, key string) string {
+	child, _ := node[key].(map[string]any)
+	return stringOrEmpty(child["id"])
+}
+
+func (c *Client) stateIDForIssue(ctx context.Context, issue Issue, stateName string) (string, error) {
+	if strings.TrimSpace(issue.ID) == "" || strings.TrimSpace(stateName) == "" {
+		return "", nil
+	}
+	payload, err := c.graphql(ctx, workflowStatesForIssueQuery, map[string]any{"id": issue.ID})
+	if err != nil {
+		return "", err
+	}
+	stateNodes := []map[string]any{}
+	if issueNode, ok := digMap(payload, "data", "issue"); ok {
+		if teamNode, ok := digMap(issueNode, "team"); ok {
+			if statesNode, ok := digMap(teamNode, "states"); ok {
+				stateNodes = sliceMap(statesNode["nodes"])
+			}
+		}
+	}
+	target := strings.ToLower(strings.TrimSpace(stateName))
+	for _, node := range stateNodes {
+		if strings.ToLower(strings.TrimSpace(stringOrEmpty(node["name"]))) == target {
+			return stringOrEmpty(node["id"]), nil
+		}
+	}
+	return "", nil
+}
+
 const candidateIssuesQuery = `
 query CandidateIssues($projectSlug: String!, $stateNames: [String!], $first: Int!, $after: String) {
   issues(
@@ -367,7 +524,9 @@ query CandidateIssues($projectSlug: String!, $stateNames: [String!], $first: Int
   ) {
     nodes {
       id identifier title description priority branchName url createdAt updatedAt
-      state { name }
+      state { id name }
+      project { id }
+      team { id }
       labels { nodes { name } }
       relations { nodes { type relatedIssue { id identifier state { name } } } }
     }
@@ -383,7 +542,9 @@ query IssuesByStates($projectSlug: String!, $stateNames: [String!], $first: Int!
   ) {
     nodes {
       id identifier title description priority branchName url createdAt updatedAt
-      state { name }
+      state { id name }
+      project { id }
+      team { id }
       labels { nodes { name } }
       relations { nodes { type relatedIssue { id identifier state { name } } } }
     }
@@ -395,9 +556,84 @@ query IssueStatesByIds($ids: [ID!]!) {
   issues(filter: { id: { in: $ids } }, first: 250) {
     nodes {
       id identifier title description priority branchName url createdAt updatedAt
-      state { name }
+      state { id name }
+      project { id }
+      team { id }
       labels { nodes { name } }
       relations { nodes { type relatedIssue { id identifier state { name } } } }
     }
+  }
+}`
+
+const issueByIdentifierQuery = `
+query IssueByIdentifier($identifier: String!) {
+  issues(filter: { identifier: { eq: $identifier } }, first: 1) {
+    nodes {
+      id identifier title description priority branchName url createdAt updatedAt
+      state { id name }
+      project { id }
+      team { id }
+      labels { nodes { name } }
+      relations { nodes { type relatedIssue { id identifier state { name } } } }
+    }
+  }
+}`
+
+const issueByTitleQuery = `
+query IssueByTitle($projectSlug: String!, $title: String!) {
+  issues(filter: { project: { slugId: { eq: $projectSlug } }, title: { eq: $title } }, first: 1) {
+    nodes {
+      id identifier title description priority branchName url createdAt updatedAt
+      state { id name }
+      project { id }
+      team { id }
+      labels { nodes { name } }
+      relations { nodes { type relatedIssue { id identifier state { name } } } }
+    }
+  }
+}`
+
+const workflowStatesForIssueQuery = `
+query WorkflowStatesForIssue($id: String!) {
+  issue(id: $id) {
+    id
+    team {
+      id
+      states {
+        nodes {
+          id
+          name
+        }
+      }
+    }
+  }
+}`
+
+const issueCreateMutation = `
+mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) {
+    success
+    issue {
+      id identifier title description priority branchName url createdAt updatedAt
+      state { id name }
+      project { id }
+      team { id }
+      labels { nodes { name } }
+      relations { nodes { type relatedIssue { id identifier state { name } } } }
+    }
+  }
+}`
+
+const issueUpdateMutation = `
+mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) {
+    success
+  }
+}`
+
+const commentCreateMutation = `
+mutation CommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) {
+    success
   }
 }`
